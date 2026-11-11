@@ -1,0 +1,1720 @@
+# Home Assistant Connect AUX-2 with a Sound Blaster X G6 on USB.
+#
+# Based on NabuCasa/aux-2 packages/aux-2.yaml @ 4fb67ad (2026-11-05). Keeps the
+# AUX-2's own audio outputs and RS-232 ports; removes Bluetooth and the USB
+# dongle support (Z-Wave, Zigbee, USB serial); and adds:
+#   - "USB" as a third Audio Output next to Analog (PCM5122 DAC) and Digital
+#     (TOSLink), so Sendspin, Music Assistant and announcements can play on
+#     the G6
+#   - the G6's input as a Sendspin source, with mute, gain and Auto settings
+#   - G6 controls over standard USB Audio requests: recording source, mute
+#     and per-input levels, per-input monitoring, playback volume, mute and
+#     balance, plus connection, model and firmware
+#   - Creative's own G6 settings (output, Direct Mode, mic boost, lighting),
+#     sent as the reports the soundblaster-x-g6-cli project captured. These
+#     are write-only: Home Assistant shows what was last sent from here.
+#
+# The ESP32-S3 USB host is full speed only, so the G6 runs as a USB 1.1 /
+# UAC1 device there. The USB-A port is behind a hub.
+
+substitutions:
+  fw_version: 0.0.0
+  # Audio is 48 kHz 16-bit stereo everywhere except the USB link itself.
+  # The G6's playback and capture interfaces only offer 48 kHz 24-bit
+  # (3-byte samples), so the firmware converts 16 to 24 bits on the way out
+  # and 24 to 16 bits on the way in. Set to "16" for a card that takes 16-bit.
+  usb_card_bits: "24"
+  # USB input sample rate. Streamed to Sendspin as 16-bit uncompressed PCM
+  # (48 kHz 16-bit stereo is about 1.5 Mbit/s).
+  usb_in_sample_rate: "48000"
+
+esphome:
+  friendly_name: Home Assistant Connect AUX-2
+  name: connect-aux-2
+  name_add_mac_suffix: true
+  min_version: 2026.11.0
+  project:
+    name: Nabu Casa.Home Assistant Connect AUX-2
+    version: ${fw_version}
+  on_boot:
+    # Must run before improv_serial::setup() but still after the
+    # 250-priority network components (wifi (250), ethernet (250)), and
+    # w5500_link_monitor (250) have all completed setup() — all DISABLED.
+    # Activate exactly one interface based on the persisted use_wifi flag;
+    # the inactive component leaves SPI / the W5500 untouched so whichever
+    # wins owns the bus alone. Transitions to the other interface cross a
+    # reboot, driven by w5500_link_monitor (in Wi-Fi mode, on cable insert),
+    # ethernet.on_disconnect (in Ethernet mode, on cable removal), or
+    # eth_boot_connect_check (in Ethernet mode, no cable/IP at boot).
+    # List form so overlay packages (factory.yaml) can append their own
+    # on_boot automation without deep-merging into this one.
+    - priority: 205
+      then:
+        - if:
+            condition:
+              lambda: 'return id(use_wifi);'
+            then:
+              - wifi.enable:
+              - w5500_link_monitor.start: link_monitor
+            else:
+              - ethernet.enable:
+              - script.execute: eth_boot_connect_check
+    # Each time the G6 connects: re-read its topology and send the G6 settings.
+    - priority: -100
+      then:
+        - lambda: |-
+            id(g6_control)->add_on_connection_callback([](bool connected) {
+              id(g6_topology_ready) = false;
+              id(g6_play_volume) = NAN;
+              id(g6_play_muted) = -1;
+              if (connected)
+                id(g6_apply)->execute();
+            });
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    version: recommended
+    advanced:
+      nvs_encryption:
+        key_id: 0
+    sdkconfig_options:
+      # Moves instructions and read only data from flash into PSRAM on boot.
+      # Both enabled allows instructions to execute while a flash operation is in progress without needing to be placed in IRAM.
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+psram:
+  id: psram_component
+  mode: octal
+  speed: 80MHz
+  ignore_not_found: false  # AUX-2 has PSRAM, so this is safe
+
+external_components:
+  - source: github://NabuCasa/aux-2@main
+    components: [w5500_link_monitor]
+
+# Restored from NVS at boot. Drives which network interface comes up via the
+# on_boot lambda above. The "Network Interface" select component updates this
+# value and reboots so the change takes effect.
+globals:
+  - id: use_wifi
+    type: bool
+    restore_value: yes
+    # Default Wi-Fi on a fresh/factory-reset device so improv_serial and the AP are
+    # available immediately for provisioning (no startup wait). w5500_link_monitor
+    # runs in Wi-Fi mode and, if a cable is present, fires on_link_up on its first
+    # poll (~2s) -> sets use_wifi=false -> reboot into Ethernet. restore_value keeps
+    # the learned interface across reboots, so this initial_value only applies on the
+    # very first boot (or after a factory reset).
+    initial_value: 'true'
+  # Set while the factory-reset hold is armed (solid red); reset fires on release.
+  - id: factory_reset_armed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # G6 unit IDs, found by g6_apply from the G6's USB Audio topology (0 = none).
+  # Arrays start zeroed (no initial_value: '{}' is ambiguous for std::array).
+  # Input order: mic, line in, optical in, what u hear.
+  - id: g6_topology_ready
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: g6_rec_fu
+    type: std::array<uint8_t, 4>
+    restore_value: no
+  - id: g6_rec_sel
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  - id: g6_rec_sel_pin
+    type: std::array<uint8_t, 4>
+    restore_value: no
+  - id: g6_rec_shared
+    type: std::array<uint8_t, 4>
+    restore_value: no
+  - id: g6_fu_play
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+  # Monitoring units: mic, line in, optical in
+  - id: g6_fu_mon
+    type: std::array<uint8_t, 3>
+    restore_value: no
+  # Read back from the G6 by g6_read_state (written on the USB task)
+  - id: g6_play_volume
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: g6_play_muted
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  # Creative settings (HID): the G6 interface they go to, and the reports
+  # waiting to be sent by g6_hid_send
+  - id: g6_hid_iface
+    type: uint8_t
+    restore_value: no
+    initial_value: '4'
+  - id: g6_hid_queue
+    type: std::vector<std::pair<std::string, std::vector<uint8_t>>>
+    restore_value: no
+  - id: g6_hid_inflight
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # G6 Lighting color, 0 to 1 per channel, set by the light's outputs
+  - id: g6_rgb
+    type: std::array<float, 3>
+    restore_value: no
+
+network:
+  id: network_component
+  priority:
+    - ethernet
+    - wifi
+
+ethernet:
+  id: eth_component
+  enable_on_boot: false
+  type: W5500
+  clock_speed: 80MHz
+  clk_pin: 12
+  mosi_pin: 11
+  miso_pin: 13
+  cs_pin: 10
+  interrupt_pin: 14
+  reset_pin: 39
+  # Cable unplugged while running on ethernet → reboot into wifi. The
+  # disconnect_trigger only fires after we've reached CONNECTED at least
+  # once (see ethernet_component_esp32.cpp), so initial CONNECTING-state
+  # retries on a no-cable boot don't churn this action.
+  on_disconnect:
+    - globals.set:
+        id: use_wifi
+        value: 'true'
+    - lambda: 'global_preferences->sync();'
+    - delay: 500ms
+    - button.press: restart_button
+
+# Active only on Wi-Fi-mode boots. Polls the W5500's PHYCFGR register over
+# SPI and fires on_link_up when a cable is detected, so we reboot into
+# ethernet mode. Inherits SPI host, pins, and clock speed from the ethernet
+# component above — only one of the two ever calls spi_bus_initialize() on
+# a given boot.
+w5500_link_monitor:
+  id: link_monitor
+  ethernet_id: eth_component
+  on_link_up:
+    - globals.set:
+        id: use_wifi
+        value: 'false'
+    - lambda: 'global_preferences->sync();'
+    - delay: 500ms
+    - button.press: restart_button
+
+wifi:
+  id: wifi_component
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  enable_btm: true
+  enable_rrm: true
+  enable_on_boot: false
+  power_save_mode: none
+  use_psram: true
+
+# Wi-Fi credentials come from secrets.yaml. Improv over USB-C stays as a fallback
+# for setting up a different network.
+improv_serial:
+  id: improv_serial_component
+
+logger:
+  id: logger_component
+  hardware_uart: UART0
+
+api:
+  id: api_component
+  # Device runs standalone as a SendSpin audio device; don't reboot
+  # when no Home Assistant client is connected.
+  reboot_timeout: 0s
+  encryption:
+    key: !secret api_key
+  # Shown by Home Assistant when the device is added.
+  wizard:
+    pages:
+      - title: Sendspin
+        description: Choose how this device works with Sendspin. You can change this later in the device's settings.
+        entities:
+          - id: sendspin_switch
+            description: Lets Sendspin servers, such as Music Assistant, play audio on this device.
+          - id: sendspin_unpaired_access_switch
+            description: Lets Sendspin servers play without pairing first. Turn off to allow only paired servers.
+
+ota:
+  - platform: esphome
+    id: esphome_ota
+
+http_request:
+  id: http_request_component
+
+
+mdns:
+  id: mdns_component
+
+usb_host:
+  id: usb_host_component
+  enable_hubs: true
+  # Room for the G6's 64-byte Creative settings reports in one control transfer
+  max_packet_size: 128
+  devices:
+    # Control link to the Sound Blaster X G6 (Creative, VID 0x041E), used for
+    # the G6 settings and readings below. Shares the G6 with usb_audio and
+    # only sends USB Audio requests on the control endpoint, so it uses no
+    # extra USB host channel. pid 0 matches any Creative device.
+    - id: g6_control
+      vid: 0x041E
+      pid: 0x0000
+
+##### UARTs & Serial Proxies
+uart:
+  - id: uart_rs232_port_1
+    tx_pin: 17
+    rx_pin: 18
+    baud_rate: 9600
+  - id: uart_rs232_port_2
+    tx_pin: 47
+    rx_pin: 48
+    baud_rate: 9600
+
+serial_proxy:
+  - id: rs232_proxy_1
+    uart_id: uart_rs232_port_1
+    name: RS-232 Port 1
+    port_type: RS232
+  - id: rs232_proxy_2
+    uart_id: uart_rs232_port_2
+    name: RS-232 Port 2
+    port_type: RS232
+
+##### Audio hardware
+i2c:
+  # Audio codec
+  - id: i2c_audio
+    scl: 16
+    sda: 15
+    frequency: 400kHz
+    scan: true
+
+i2s_audio:
+  - id: i2s_bus
+    i2s_bclk_pin: 5
+    i2s_mclk_pin: 4
+    i2s_lrclk_pin: 6
+
+audio_dac:
+  - platform: pcm5122
+    id: pcm5122_dac
+    i2c_id: i2c_audio
+    address: 0x4C   # Board straps ADR1=ADR2=0 (driver default is 0x4D)
+    enable_pin: 3   # Codec_XSMT (mute)
+    bits_per_sample: 32bit  # Matches the DAC speaker's I2S slot width
+
+usb_audio:
+  id: usb_audio_hub
+
+microphone:
+  # G6 input (mic / line / optical / What U Hear, picked by "G6 Recording
+  # Source"). Only runs while something listens: the Sendspin source or the
+  # level meter.
+  - platform: usb_audio
+    id: usb_mic
+    sample_rate: ${usb_in_sample_rate}
+    bits_per_sample: ${usb_card_bits}bit
+    num_channels: 2
+
+speaker:
+  # Router: "Audio Output" picks the DAC, TOSLink or the G6
+  - platform: router
+    id: audio_router_speaker
+    output_speakers:
+      - i2s_audio_dac_speaker
+      - i2s_audio_spdif_speaker
+      - usb_card_converter
+    bits_per_sample: 16
+    num_channels: 2
+    sample_rate: 48000
+
+  # Analog output (PCM5122 DAC)
+  - platform: i2s_audio
+    id: i2s_audio_dac_speaker
+    sample_rate: 48000
+    i2s_dout_pin: 7
+    bits_per_sample: 32bit  # 16-bit audio in 32-bit slots, as the DAC is set up for
+    i2s_audio_id: i2s_bus
+    dac_type: external
+    channel: stereo
+    timeout: never
+    buffer_duration: 50ms
+    audio_dac: pcm5122_dac
+
+  # Digital output (TOSLink)
+  - platform: i2s_audio
+    id: i2s_audio_spdif_speaker
+    sample_rate: 48000
+    i2s_dout_pin: 40
+    spdif_mode: true
+    bits_per_sample: 16bit
+    i2s_audio_id: i2s_bus
+    dac_type: external
+    channel: stereo
+    timeout: 5s
+    buffer_duration: 50ms
+    use_apll: true
+
+  # USB output (G6). Volume and mute are passed to the G6.
+  - platform: resampler
+    id: usb_card_converter
+    task_stack_in_psram: true
+    output_speaker: usb_speaker
+    sample_rate: 48000
+    bits_per_sample: ${usb_card_bits}
+  - platform: usb_audio
+    id: usb_speaker
+    sample_rate: 48000
+    bits_per_sample: ${usb_card_bits}bit
+    num_channels: 2
+
+  # Combines the announcement and media streams, at 16-bit
+  - platform: mixer
+    id: mixing_speaker
+    task_stack_in_psram: true
+    output_speaker: audio_router_speaker
+    num_channels: 2
+    source_speakers:
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  # Resamples each pipeline to 48 kHz 16-bit, as the mixer needs one format
+  - platform: resampler
+    id: announcement_resampling_speaker
+    task_stack_in_psram: true
+    output_speaker: announcement_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+  - platform: resampler
+    id: media_resampling_speaker
+    task_stack_in_psram: true
+    output_speaker: media_mixing_input
+    sample_rate: 48000
+    bits_per_sample: 16
+
+##### Sendspin
+sendspin:
+  id: sendspin_hub
+  task_stack_in_psram: true
+  # USB input offered to the Sendspin server as a source. The server decides
+  # when to pull it; "USB Input to Sendspin" says whether there's audio to offer.
+  source:
+    microphone:
+      # Gain is set at runtime by the "USB Input Gain" number.
+      id: usb_in_sendspin_source
+      microphone: usb_mic
+      channels: [0, 1]
+      bits_per_sample: 16
+    task_stack_in_psram: true
+    on_streaming_started:
+      - binary_sensor.template.publish:
+          id: usb_input_streaming
+          state: true
+    on_streaming_stopped:
+      - binary_sensor.template.publish:
+          id: usb_input_streaming
+          state: false
+
+audio:
+  codecs:
+    flac:
+
+media_source:
+  - platform: audio_http
+    id: announcement_http_source
+    task_stack_in_psram: true
+  - platform: audio_http
+    id: media_http_source
+    task_stack_in_psram: true
+  - platform: sendspin
+    id: sendspin_source
+    task_stack_in_psram: true
+    static_delay_adjustable: true
+    codecs: [flac, pcm]
+    bits_per_sample: 16
+
+media_player:
+  # Full 0-100% range: the USB device's own volume control does the scaling.
+  - platform: speaker_source
+    id: external_media_player
+    name: Media Player
+    volume_increment: 0.05
+    announcement_pipeline:
+      speaker: announcement_resampling_speaker
+      format: FLAC  # FLAC is the least processor intensive codec
+      num_channels: 1  # Stereo audio is unnecessary for announcements
+      sample_rate: 48000
+      sources:
+        - announcement_http_source
+    media_pipeline:
+      speaker: media_resampling_speaker
+      format: FLAC
+      num_channels: 2
+      sample_rate: 48000
+      sources:
+        - media_http_source
+        - sendspin_source
+    on_announcement:
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
+    on_state:
+      if:
+        condition:
+          not:
+            media_player.is_announcing: external_media_player
+        then:
+          - mixer_speaker.apply_ducking:
+              id: media_mixing_input
+              decibel_reduction: 0
+              duration: 1.0s
+
+
+##### Settings
+select:
+  - platform: template
+    id: audio_output_selector
+    name: Audio Output
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - "Analog"
+      - "Digital"
+      - "USB"
+    on_value:
+      - router.speaker.switch_output:
+          id: audio_router_speaker
+          target_speaker: !lambda |-
+            if (x == "Digital")
+              return id(i2s_audio_spdif_speaker);
+            if (x == "USB")
+              return id(usb_card_converter);
+            return id(i2s_audio_dac_speaker);
+
+  # What the G6 sends over USB. Points the G6's recording path at this input
+  # and mutes the others.
+  - platform: template
+    id: g6_recording_source
+    name: G6 Recording Source
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: "Mic"
+    options:
+      - "Mic"
+      - "Line In"
+      - "Optical In"
+      - "What U Hear"
+    on_value:
+      - script.execute: g6_apply
+
+  # Creative settings. These are only sent when you change them, and the
+  # G6 can't report them back, so these show what was last sent from here.
+  - platform: template
+    id: g6_output
+    name: G6 Output
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - "Speakers"
+      - "Headphones"
+    set_action:
+      - lambda: |-
+          auto frame = [](uint8_t m1, uint8_t m2, uint8_t i1, uint8_t i2, uint8_t feature) {
+            std::vector<uint8_t> f(64, 0);
+            f[0] = 0x5A; f[1] = m1; f[2] = m2; f[3] = i1; f[4] = i2; f[5] = feature;
+            return f;
+          };
+          const bool phones = x == "Headphones";
+          std::vector<std::vector<uint8_t>> frames;
+          frames.push_back(frame(0x2C, 0x05, 0x00, phones ? 0x04 : 0x02, 0x00));
+          frames.push_back(frame(0x2C, 0x01, 0x01, 0x00, 0x00));
+          // Followed by the same data/commit pairs Creative's software sends
+          std::vector<uint8_t> features{0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x09};
+          if (phones)
+            features.push_back(0x06);
+          features.push_back(0x09);
+          for (const uint8_t f : features) {
+            frames.push_back(frame(0x12, 0x07, 0x01, 0x96, f));
+            frames.push_back(frame(0x11, 0x03, 0x01, 0x96, f));
+          }
+          ESP_LOGI("g6", "Output -> %s (%u reports)", phones ? "headphones" : "speakers",
+                   static_cast<unsigned>(frames.size()));
+          for (auto &f : frames)
+            id(g6_hid_queue).push_back({std::string("output ") + (phones ? "headphones" : "speakers"), f});
+      - script.execute: g6_hid_send
+
+  - platform: template
+    id: g6_mic_boost
+    name: G6 Mic Boost
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    options:
+      - "0 dB"
+      - "10 dB"
+      - "20 dB"
+      - "30 dB"
+    set_action:
+      - lambda: |-
+          const uint8_t db = x == "30 dB" ? 30 : x == "20 dB" ? 20 : x == "10 dB" ? 10 : 0;
+          std::vector<uint8_t> data(64, 0), commit(64, 0);
+          data[0] = 0x5A; data[1] = 0x3C; data[2] = 0x04; data[5] = 0x02; data[6] = db;
+          commit[0] = 0x5A; commit[1] = 0x3C; commit[2] = 0x02; commit[3] = 0x01;
+          ESP_LOGI("g6", "Mic boost -> %u dB", static_cast<unsigned>(db));
+          id(g6_hid_queue).push_back({"mic boost", data});
+          id(g6_hid_queue).push_back({"mic boost commit", commit});
+      - script.execute: g6_hid_send
+
+  - platform: template
+    id: usb_input_mode
+    name: USB Input to Sendspin
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: "Auto"
+    options:
+      - "Off"
+      - "On"
+      - "Auto"
+    on_value:
+      # On and Auto keep the input open so the level meters show what the
+      # G6 is sending; Auto also uses them to decide whether to offer it.
+      - if:
+          condition:
+            lambda: 'return x == "Off";'
+          then:
+            - sound_level.stop: usb_in_level_meter
+          else:
+            - sound_level.start: usb_in_level_meter
+      - sendspin.source.set_signal:
+          present: !lambda |-
+            if (x == "Auto")
+              return id(usb_input_playing).state;
+            return x == "On";
+
+number:
+  # The G6's own recording level for each input (-48 to +9 dB). Raise these
+  # before the digital USB Input Gain below: it's the cleaner gain.
+  - platform: template
+    id: g6_rec_vol_mic
+    name: G6 Mic Recording Volume
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -48
+    max_value: 9
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: g6_apply
+
+  - platform: template
+    id: g6_rec_vol_line
+    name: G6 Line In Recording Volume
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -48
+    max_value: 9
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: g6_apply
+
+  - platform: template
+    id: g6_rec_vol_optical
+    name: G6 Optical In Recording Volume
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -48
+    max_value: 9
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: g6_apply
+
+  - platform: template
+    id: g6_rec_vol_wuh
+    name: G6 What U Hear Recording Volume
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -48
+    max_value: 9
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: g6_apply
+
+  # Level of each input when monitored through the G6's own outputs
+  - platform: template
+    id: g6_mon_vol_mic
+    name: G6 Mic Monitoring Volume
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -64
+    max_value: 0
+    step: 1
+    initial_value: -20
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: g6_apply
+
+  - platform: template
+    id: g6_mon_vol_line
+    name: G6 Line In Monitoring Volume
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -64
+    max_value: 0
+    step: 1
+    initial_value: -20
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: g6_apply
+
+  - platform: template
+    id: g6_mon_vol_optical
+    name: G6 Optical In Monitoring Volume
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -64
+    max_value: 0
+    step: 1
+    initial_value: -20
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: g6_apply
+
+  # The G6's playback volume, read back from the G6 every 5 s, so it also
+  # follows the G6's knob and the media player volume when the output is USB.
+  - platform: template
+    id: g6_playback_volume
+    name: G6 Playback Volume
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -64
+    max_value: 0
+    step: 1
+    update_interval: 5s
+    lambda: return id(g6_play_volume);
+    set_action:
+      - lambda: |-
+          id(g6_play_volume) = x;
+          id(g6_set_playback_volume)->execute(x);
+
+  # Left/right balance on the G6's playback. Positive turns the left side
+  # down, negative the right. Kept in place by g6_read_state, so after a
+  # volume change it can take up to 5 s to come back.
+  - platform: template
+    id: g6_balance
+    name: G6 Balance
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: -20
+    max_value: 20
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          if (!std::isnan(id(g6_play_volume)))
+            id(g6_set_playback_volume)->execute(id(g6_play_volume));
+
+  # Digital gain on the audio sent to Sendspin, in 6 dB steps (x1 to x64).
+  # Doesn't change the level meters, so Auto mode isn't affected.
+  - platform: template
+    id: usb_input_gain
+    name: USB Input Gain
+    entity_category: config
+    unit_of_measurement: dB
+    mode: slider
+    min_value: 0
+    max_value: 36
+    step: 6
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          id(usb_in_sendspin_source)->set_gain_factor(1 << (int(x) / 6));
+
+  # Auto mode: RMS level the input must pass to count as playing.
+  - platform: template
+    id: usb_input_threshold
+    name: USB Input Auto Threshold
+    entity_category: config
+    unit_of_measurement: dB
+    mode: box
+    min_value: -90
+    max_value: -10
+    step: 1
+    initial_value: -60
+    optimistic: true
+    restore_value: true
+
+  # Auto mode: how long the input stays offered after it goes quiet.
+  - platform: template
+    id: usb_input_hold_time
+    name: USB Input Auto Hold Time
+    entity_category: config
+    unit_of_measurement: s
+    mode: box
+    min_value: 0
+    max_value: 300
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+
+sensor:
+  # 3.5 mm combo-jack detect (v3+ hardware only; the pin floats on v2, so
+  # leave "Automatic output mode selection" off there). Voltage rails:
+  #   ~0.00 V analog TRS plug, ~1.65 V nothing inserted, ~2.20 V TOSLink-mini plug
+  # Never switches away from USB.
+  - platform: adc
+    pin: 8
+    id: jack_detect_voltage
+    entity_category: diagnostic
+    attenuation: 12db
+    update_interval: 1s
+    on_value_range:
+      - below: 0.8
+        then:
+          - if:
+              condition:
+                and:
+                  - switch.is_on: auto_output_mode_switch
+                  - lambda: 'return id(audio_output_selector).current_option() != "USB";'
+              then:
+                - select.set:
+                    id: audio_output_selector
+                    option: "Analog"
+      - above: 2.0
+        then:
+          - if:
+              condition:
+                and:
+                  - switch.is_on: auto_output_mode_switch
+                  - lambda: 'return id(audio_output_selector).current_option() != "USB";'
+              then:
+                - select.set:
+                    id: audio_output_selector
+                    option: "Digital"
+
+  # USB input level, used by Auto mode and to check what the G6 sends.
+  # Started and stopped by "USB Input to Sendspin".
+  - platform: sound_level
+    id: usb_in_level_meter
+    microphone:
+      microphone: usb_mic
+      channels: [0, 1]
+    passive: false
+    measurement_duration: 500ms
+    # Digital silence (all zeros) reads -120 dB; "unknown" means no audio
+    # is arriving at all.
+    rms:
+      id: usb_in_level
+      name: USB Input Level
+      entity_category: diagnostic
+      filters:
+        - lambda: 'return std::isfinite(x) ? x : -120.0f;'
+    # Watch this while setting the gain: near 0 dB means clipping.
+    peak:
+      id: usb_in_peak
+      name: USB Input Peak
+      entity_category: diagnostic
+      filters:
+        - lambda: 'return std::isfinite(x) ? x : -120.0f;'
+
+binary_sensor:
+  # USB input has audio on it (Auto mode). The hold time rides out gaps
+  # between tracks so the Sendspin source doesn't drop.
+  - platform: template
+    id: usb_input_playing
+    name: USB Input Playing
+    lambda: return id(usb_in_level).state > id(usb_input_threshold).state;
+    filters:
+      - delayed_off: !lambda 'return id(usb_input_hold_time).state * 1000;'
+    on_state:
+      - if:
+          condition:
+            lambda: 'return id(usb_input_mode).current_option() == "Auto";'
+          then:
+            - sendspin.source.set_signal:
+                present: !lambda 'return x;'
+
+  # The Sendspin server is pulling the USB input right now.
+  - platform: template
+    id: usb_input_streaming
+    name: USB Input Streaming
+    entity_category: diagnostic
+
+  - platform: template
+    id: g6_connected
+    name: G6 Connected
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return id(g6_control)->is_connected();
+
+  # Factory reset: hold the GPIO 0 button, blink at 5 s, solid red at 15 s
+  # (armed), release to wipe and reboot. Releasing before 15 s cancels.
+  - platform: gpio
+    id: factory_reset_hold_button
+    pin:
+      number: 0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+      ignore_strapping_warning: true
+    filters:
+      - delayed_on_off: 10ms
+    on_press:
+      - script.execute: factory_reset_hold
+    on_release:
+      - script.stop: factory_reset_hold
+      - if:
+          condition:
+            lambda: 'return id(factory_reset_armed);'
+          then:
+            - button.press: factory_reset_button
+          else:
+            - light.turn_off: status_light
+
+text_sensor:
+  - platform: template
+    id: g6_model
+    name: G6 Model
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      usb_host::UsbDeviceInfo info;
+      if (!id(g6_control)->get_device_info(info))
+        return {"Not connected"};
+      return {std::string(info.product)};
+
+  # The G6's firmware revision as it reports it over USB (bcdDevice)
+  - platform: template
+    id: g6_firmware
+    name: G6 Firmware
+    entity_category: diagnostic
+    update_interval: 30s
+    lambda: |-
+      usb_host::UsbDeviceInfo info;
+      if (!id(g6_control)->get_device_info(info))
+        return {"Not connected"};
+      char buf[12];
+      snprintf(buf, sizeof(buf), "%x.%02x", static_cast<unsigned>(info.bcd_device >> 8),
+               static_cast<unsigned>(info.bcd_device & 0xFF));
+      return {std::string(buf)};
+
+button:
+  - platform: restart
+    id: restart_button
+    name: Restart
+    entity_category: diagnostic
+  - platform: factory_reset
+    id: factory_reset_button
+    name: Factory Reset
+    entity_category: diagnostic
+    disabled_by_default: true
+
+switch:
+  # VBUS on the USB-A port. Turn off and on to power-cycle the G6.
+  - platform: gpio
+    id: usb_device_power_switch
+    name: USB Device Power
+    pin: 42
+    restore_mode: ALWAYS_ON
+    entity_category: config
+  # Silences the USB input for everything that uses it (Sendspin and the
+  # level meter, so Auto mode reports nothing to offer while muted).
+  - platform: template
+    id: usb_input_mute_switch
+    name: USB Input Mute
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    turn_on_action:
+      - microphone.mute: usb_mic
+    turn_off_action:
+      - microphone.unmute: usb_mic
+  # The G6's playback mute, read back from the G6 every 5 s
+  - platform: template
+    id: g6_playback_mute
+    name: G6 Playback Mute
+    lambda: |-
+      if (id(g6_play_muted) < 0)
+        return {};
+      return id(g6_play_muted) == 1;
+    turn_on_action:
+      - lambda: |-
+          id(g6_play_muted) = 1;
+          id(g6_set_playback_mute)->execute(true);
+    turn_off_action:
+      - lambda: |-
+          id(g6_play_muted) = 0;
+          id(g6_set_playback_mute)->execute(false);
+  # Mutes what the G6 records (all inputs), on the G6 itself
+  - platform: template
+    id: g6_recording_mute
+    name: G6 Recording Mute
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - script.execute: g6_apply
+    on_turn_off:
+      - script.execute: g6_apply
+  # Creative setting: skips the G6's SBX and EQ processing. Only sent when
+  # changed; the G6 can't report it back.
+  - platform: template
+    id: g6_direct_mode
+    name: G6 Direct Mode
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: |-
+          std::vector<uint8_t> data(64, 0), commit(64, 0);
+          data[0] = 0x5A; data[1] = 0x39; data[2] = 0x03; data[3] = 0x00; data[4] = 0x05; data[5] = 0x01;
+          commit[0] = 0x5A; commit[1] = 0x39; commit[2] = 0x01; commit[3] = 0x01;
+          ESP_LOGI("g6", "Direct mode -> on");
+          id(g6_hid_queue).push_back({"direct mode on", data});
+          id(g6_hid_queue).push_back({"direct mode commit", commit});
+      - script.execute: g6_hid_send
+    turn_off_action:
+      - lambda: |-
+          std::vector<uint8_t> data(64, 0), commit(64, 0);
+          data[0] = 0x5A; data[1] = 0x39; data[2] = 0x03; data[3] = 0x00; data[4] = 0x05; data[5] = 0x00;
+          commit[0] = 0x5A; commit[1] = 0x39; commit[2] = 0x01; commit[3] = 0x01;
+          ESP_LOGI("g6", "Direct mode -> off");
+          id(g6_hid_queue).push_back({"direct mode off", data});
+          id(g6_hid_queue).push_back({"direct mode commit", commit});
+      - script.execute: g6_hid_send
+  # G6 monitoring: plays an input through the G6's own outputs (headphones /
+  # speakers) at its "G6 ... Monitoring Volume"
+  - platform: template
+    id: g6_monitor_mic
+    name: G6 Mic Monitoring
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - script.execute: g6_apply
+    on_turn_off:
+      - script.execute: g6_apply
+  - platform: template
+    id: g6_monitor_line
+    name: G6 Line In Monitoring
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - script.execute: g6_apply
+    on_turn_off:
+      - script.execute: g6_apply
+  - platform: template
+    id: g6_monitor_optical
+    name: G6 Optical In Monitoring
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    entity_category: config
+    on_turn_on:
+      - script.execute: g6_apply
+    on_turn_off:
+      - script.execute: g6_apply
+  - platform: sendspin
+    type: enabled
+    id: sendspin_switch
+    name: Sendspin
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+  - platform: sendspin
+    type: unpaired_access
+    id: sendspin_unpaired_access_switch
+    name: Sendspin unpaired access
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+  - platform: template
+    id: auto_output_mode_switch
+    name: Automatic output mode selection
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+    disabled_by_default: true
+    on_turn_on:
+      - lambda: |-
+          if (id(audio_output_selector).current_option() == "USB")
+            return;
+          float v = id(jack_detect_voltage).state;
+          if (std::isnan(v))
+            return;
+          if (v < 0.8f) {
+            auto call = id(audio_output_selector).make_call();
+            call.set_option("Analog");
+            call.perform();
+          } else if (v > 2.0f) {
+            auto call = id(audio_output_selector).make_call();
+            call.set_option("Digital");
+            call.perform();
+          }
+
+interval:
+  # Read the G6's playback volume and mute
+  - interval: 5s
+    then:
+      - script.execute: g6_read_state
+
+script:
+  # Sends the G6 settings above. On the first run after the G6 connects it
+  # reads the G6's USB Audio topology (from the descriptor the USB host stack
+  # keeps), logs it under "g6", and finds:
+  #   - the recording path to the USB stream: one unit per input, any
+  #     selector, and the shared record controls after the mix
+  #   - the playback path: the playback volume unit and the monitoring unit
+  #     for each input
+  # Then it sends the recording source, recording level and monitoring as
+  # USB Audio SET_CUR requests, one at a time, logging each result. If the
+  # topology can't be read it falls back to the unit IDs from the
+  # soundblaster-x-g6-cli captures.
+  - id: g6_apply
+    mode: restart
+    then:
+      - lambda: |-
+          auto *g6 = id(g6_control);
+          if (!g6->is_connected()) {
+            ESP_LOGD("g6", "G6 not connected; settings not sent");
+            return;
+          }
+          // Input categories, in "G6 Recording Source" order
+          static const char *const NAMES[] = {"Mic", "Line In", "Optical In", "What U Hear"};
+          auto category = [](uint16_t t) -> uint8_t {
+            if ((t & 0xFF00) == 0x0200 || (t >= 0x0402 && t <= 0x0405))
+              return 0;  // microphones, headsets
+            if (t == 0x0601 || t == 0x0603 || t == 0x0604)
+              return 1;  // analog / line connectors
+            if (t == 0x0602 || t == 0x0605)
+              return 2;  // digital / S/PDIF
+            if (t == 0x0101)
+              return 3;  // the USB playback stream (What U Hear)
+            return 0xFF;
+          };
+          auto &rec_fu = id(g6_rec_fu);
+          auto &rec_pin = id(g6_rec_sel_pin);
+          auto &shared = id(g6_rec_shared);
+          auto &mon = id(g6_fu_mon);
+
+          if (!id(g6_topology_ready)) {
+            rec_fu.fill(0);
+            rec_pin.fill(0);
+            shared.fill(0);
+            mon.fill(0);
+            id(g6_rec_sel) = 0;
+            id(g6_fu_play) = 0;
+
+            // The device handle is protected in USBClient; a member pointer formed in a
+            // derived class reads it without changing the component
+            struct Peek : usb_host::USBClient {
+              static auto handle() { return &Peek::device_handle_; }
+            };
+            usb_device_handle_t dev = g6->*Peek::handle();
+            const usb_config_desc_t *cfg = nullptr;
+            struct Entity {
+              uint8_t id;
+              uint8_t subtype;
+              uint16_t term_type;
+              std::vector<uint8_t> sources;
+              uint16_t controls_master;  // Feature Unit control bitmaps (UAC1 bmaControls)
+              uint16_t controls_ch1;
+            };
+            std::vector<Entity> ents;
+            std::vector<uint8_t> hid_ifaces;
+            if (dev != nullptr && usb_host_get_active_config_descriptor(dev, &cfg) == ESP_OK && cfg != nullptr) {
+              const uint8_t *d = reinterpret_cast<const uint8_t *>(cfg);
+              const size_t n = cfg->wTotalLength;
+              bool in_ac = false;
+              for (size_t i = 0; i + 2 <= n;) {
+                const uint8_t len = d[i];
+                if (len < 2 || i + len > n)
+                  break;
+                const uint8_t type = d[i + 1];
+                if (type == 0x04 && len >= 9) {
+                  in_ac = d[i + 5] == 0x01 && d[i + 6] == 0x01;  // Audio class, AudioControl subclass
+                  if (d[i + 5] == 0x03 && d[i + 3] == 0 &&
+                      std::find(hid_ifaces.begin(), hid_ifaces.end(), d[i + 2]) == hid_ifaces.end())
+                    hid_ifaces.push_back(d[i + 2]);  // HID interface
+                } else if (type == 0x24 && in_ac && len >= 4) {
+                  const uint8_t sub = d[i + 2];
+                  Entity e{d[i + 3], sub, 0, {}, 0, 0};
+                  bool keep = true;
+                  if (sub == 0x02 && len >= 8) {  // Input Terminal
+                    e.term_type = d[i + 4] | (d[i + 5] << 8);
+                  } else if (sub == 0x03 && len >= 9) {  // Output Terminal
+                    e.term_type = d[i + 4] | (d[i + 5] << 8);
+                    e.sources.push_back(d[i + 7]);
+                  } else if ((sub == 0x04 || sub == 0x05) && len >= 5) {  // Mixer, Selector
+                    for (uint8_t k = 0; k < d[i + 4] && 5u + k < len; k++)
+                      e.sources.push_back(d[i + 5 + k]);
+                  } else if (sub == 0x06 && len >= 6) {  // Feature Unit
+                    e.sources.push_back(d[i + 4]);
+                    const uint8_t size = d[i + 5];
+                    for (uint8_t k = 0; k < size && k < 2; k++) {
+                      if (6u + k < len)
+                        e.controls_master |= d[i + 6 + k] << (8 * k);
+                      if (6u + size + k < len)
+                        e.controls_ch1 |= d[i + 6 + size + k] << (8 * k);
+                    }
+                  } else if ((sub == 0x07 || sub == 0x08) && len >= 7) {  // Processing, Extension
+                    for (uint8_t k = 0; k < d[i + 6] && 7u + k < len; k++)
+                      e.sources.push_back(d[i + 7 + k]);
+                  } else {
+                    keep = false;
+                  }
+                  if (keep)
+                    ents.push_back(e);
+                }
+                i += len;
+              }
+            } else {
+              ESP_LOGW("g6", "Couldn't read the G6's configuration descriptor");
+            }
+
+            auto find = [&ents](uint8_t eid) -> const Entity * {
+              for (const auto &e : ents)
+                if (e.id == eid)
+                  return &e;
+              return nullptr;
+            };
+            // The input terminal type a unit's audio comes from, or 0 when it mixes several
+            auto origin = [&find](uint8_t eid) -> uint16_t {
+              for (int depth = 0; depth < 16; depth++) {
+                const Entity *e = find(eid);
+                if (e == nullptr)
+                  return 0;
+                if (e->subtype == 0x02)
+                  return e->term_type;
+                if (e->sources.size() != 1)
+                  return 0;
+                eid = e->sources[0];
+              }
+              return 0;
+            };
+            // Everything upstream of the USB recording stream (true) or of the G6's own outputs (false)
+            auto upstream = [&ents, &find](bool usb_stream) {
+              std::vector<uint8_t> seen, work;
+              for (const auto &e : ents)
+                if (e.subtype == 0x03 && (e.term_type == 0x0101) == usb_stream)
+                  work.insert(work.end(), e.sources.begin(), e.sources.end());
+              while (!work.empty() && seen.size() < 64) {
+                const uint8_t eid = work.back();
+                work.pop_back();
+                if (std::find(seen.begin(), seen.end(), eid) != seen.end())
+                  continue;
+                seen.push_back(eid);
+                if (const Entity *e = find(eid))
+                  work.insert(work.end(), e->sources.begin(), e->sources.end());
+              }
+              return seen;
+            };
+
+            if (ents.empty()) {
+              ESP_LOGW("g6", "No audio topology found; using the captured unit IDs");
+              rec_fu = {4, 3, 5, 6};
+              mon = {10, 9, 12};
+              id(g6_fu_play) = 1;
+            } else {
+              static const char *const KIND[] = {"?", "header", "IT", "OT", "mixer", "selector",
+                                                 "FU", "processing", "extension"};
+              for (const auto &e : ents) {
+                std::string from;
+                for (auto s : e.sources)
+                  from += (from.empty() ? "" : ",") + std::to_string(s);
+                char type_buf[16] = "";
+                if (e.term_type != 0)
+                  snprintf(type_buf, sizeof(type_buf), " type 0x%04X", static_cast<unsigned>(e.term_type));
+                // Feature Unit controls, master and per channel
+                static const char *const CONTROLS[] = {"mute", "volume", "bass", "mid", "treble", "graphic-eq",
+                                                       "agc", "delay", "bass-boost", "loudness"};
+                std::string ctrls;
+                for (int pass = 0; pass < 2 && e.subtype == 0x06; pass++) {
+                  const uint16_t bits = pass == 0 ? e.controls_master : e.controls_ch1;
+                  if (bits == 0)
+                    continue;
+                  ctrls += pass == 0 ? " [master:" : " [per channel:";
+                  for (int b = 0; b < 10; b++)
+                    if (bits & (1 << b))
+                      ctrls += std::string(" ") + CONTROLS[b];
+                  ctrls += "]";
+                }
+                ESP_LOGI("g6", "%s %u%s%s%s%s", e.subtype <= 8 ? KIND[e.subtype] : "?",
+                         static_cast<unsigned>(e.id), type_buf, from.empty() ? "" : " <- ", from.c_str(),
+                         ctrls.c_str());
+              }
+              size_t shared_n = 0;
+              for (const auto eid : upstream(true)) {
+                const Entity *e = find(eid);
+                if (e == nullptr)
+                  continue;
+                if (e->subtype == 0x05) {
+                  id(g6_rec_sel) = eid;
+                  for (size_t k = 0; k < e->sources.size(); k++) {
+                    const uint8_t c = category(origin(e->sources[k]));
+                    if (c < 4 && rec_pin[c] == 0)
+                      rec_pin[c] = static_cast<uint8_t>(k + 1);
+                  }
+                } else if (e->subtype == 0x06) {
+                  const uint16_t from = origin(e->sources[0]);
+                  const uint8_t c = category(from);
+                  if (from == 0) {
+                    if (shared_n < shared.size())
+                      shared[shared_n++] = eid;
+                  } else if (c < 4 && rec_fu[c] == 0) {
+                    rec_fu[c] = eid;
+                  }
+                }
+              }
+              for (const auto eid : upstream(false)) {
+                const Entity *e = find(eid);
+                if (e == nullptr || e->subtype != 0x06)
+                  continue;
+                const uint8_t c = category(origin(e->sources[0]));
+                if (c == 3 && id(g6_fu_play) == 0)
+                  id(g6_fu_play) = eid;
+                else if (c < 3 && mon[c] == 0)
+                  mon[c] = eid;
+              }
+            }
+            ESP_LOGI("g6", "Recording units: mic %u, line %u, optical %u, what u hear %u; selector %u; "
+                           "playback %u; monitoring: mic %u, line %u, optical %u",
+                     rec_fu[0], rec_fu[1], rec_fu[2], rec_fu[3], id(g6_rec_sel), id(g6_fu_play), mon[0], mon[1],
+                     mon[2]);
+            // Creative's software uses HID interface 4; otherwise take the last HID interface
+            if (!hid_ifaces.empty()) {
+              id(g6_hid_iface) = std::find(hid_ifaces.begin(), hid_ifaces.end(), 4) != hid_ifaces.end()
+                                     ? 4
+                                     : hid_ifaces.back();
+              ESP_LOGI("g6", "Creative settings go to HID interface %u", static_cast<unsigned>(id(g6_hid_iface)));
+            } else if (!ents.empty()) {
+              ESP_LOGW("g6", "No HID interface found; Creative settings (output, direct mode, mic boost, "
+                             "lighting) won't work");
+            }
+            id(g6_topology_ready) = true;
+          }
+
+          // Build the requests
+          struct Req {
+            uint16_t value;
+            uint8_t unit;
+            std::vector<uint8_t> data;
+            std::string what;
+          };
+          auto plan = std::make_shared<std::vector<Req>>();
+          auto add_volume = [&plan](uint8_t unit, float db, const std::string &name) {
+            const int16_t v = static_cast<int16_t>(lroundf((std::isnan(db) ? 0.0f : db) * 256.0f));
+            const std::vector<uint8_t> bytes{static_cast<uint8_t>(v & 0xFF), static_cast<uint8_t>((v >> 8) & 0xFF)};
+            for (uint8_t ch = 1; ch <= 2; ch++)
+              plan->push_back({static_cast<uint16_t>(0x0200 | ch), unit, bytes,
+                               name + " volume ch" + std::to_string(ch) + " " +
+                                   std::to_string(static_cast<int>(lroundf(db))) + " dB"});
+          };
+          const auto index = id(g6_recording_source).active_index();
+          const size_t chosen = index.has_value() && *index < 4 ? *index : 0;
+          const bool rec_mute = id(g6_recording_mute).state;
+          const float rec_vol[4] = {id(g6_rec_vol_mic).state, id(g6_rec_vol_line).state, id(g6_rec_vol_optical).state,
+                                    id(g6_rec_vol_wuh).state};
+          const float mon_vol[3] = {id(g6_mon_vol_mic).state, id(g6_mon_vol_line).state, id(g6_mon_vol_optical).state};
+          bool have_shared = false;
+          for (const auto u : shared) {
+            if (u == 0)
+              continue;
+            have_shared = true;
+            plan->push_back({0x0100, u, {static_cast<uint8_t>(rec_mute ? 1 : 0)},
+                             "record mix unit " + std::to_string(u) + (rec_mute ? " mute" : " unmute")});
+          }
+          if (id(g6_rec_sel) != 0) {
+            if (rec_pin[chosen] != 0)
+              plan->push_back({0x0000, id(g6_rec_sel), {rec_pin[chosen]},
+                               std::string("record selector -> ") + NAMES[chosen]});
+            else
+              ESP_LOGW("g6", "The record selector has no %s input", NAMES[chosen]);
+          }
+          for (size_t c = 0; c < 4; c++) {
+            if (rec_fu[c] == 0)
+              continue;
+            // With no shared record control, the recording mute mutes the chosen input instead
+            const bool on = c == chosen && !(rec_mute && !have_shared);
+            plan->push_back({0x0100, rec_fu[c], {static_cast<uint8_t>(on ? 0 : 1)},
+                             std::string("record ") + NAMES[c] + (on ? " unmute" : " mute")});
+            add_volume(rec_fu[c], rec_vol[c], std::string("record ") + NAMES[c]);
+          }
+          const bool mon_on[3] = {id(g6_monitor_mic).state, id(g6_monitor_line).state, id(g6_monitor_optical).state};
+          for (size_t c = 0; c < 3; c++) {
+            if (mon[c] == 0)
+              continue;
+            plan->push_back({0x0100, mon[c], {static_cast<uint8_t>(mon_on[c] ? 0 : 1)},
+                             std::string("monitor ") + NAMES[c] + (mon_on[c] ? " unmute" : " mute")});
+            add_volume(mon[c], mon_vol[c], std::string("monitor ") + NAMES[c]);
+          }
+
+          // Send them one at a time
+          auto step = std::make_shared<std::function<void(size_t)>>();
+          std::weak_ptr<std::function<void(size_t)>> weak_step = step;
+          *step = [g6, plan, weak_step](size_t i) {
+            if (i >= plan->size()) {
+              ESP_LOGI("g6", "Settings sent (%u requests)", static_cast<unsigned>(plan->size()));
+              return;
+            }
+            auto self = weak_step.lock();
+            const Req &r = (*plan)[i];
+            const bool ok = g6->control_transfer(0x21, 0x01, r.value, static_cast<uint16_t>(r.unit << 8),
+                [plan, self, i](const usb_host::TransferStatus &rs) {
+                  const Req &req = (*plan)[i];
+                  if (rs.success) {
+                    ESP_LOGI("g6", "%s: ok", req.what.c_str());
+                  } else {
+                    ESP_LOGW("g6", "%s: failed (status %u)", req.what.c_str(), static_cast<unsigned>(rs.error_code));
+                  }
+                  if (self)
+                    (*self)(i + 1);
+                },
+                r.data);
+            if (!ok) {
+              ESP_LOGW("g6", "%s: couldn't send", r.what.c_str());
+              if (self)
+                (*self)(i + 1);
+            }
+          };
+          (*step)(0);
+
+  # Reads the G6's playback mute and left/right volume (GET_CUR) into the
+  # globals behind "G6 Playback Mute" and "G6 Playback Volume", and keeps
+  # "G6 Balance" applied: if the two sides don't match the balance (after a
+  # volume change from the media player or the G6's knob), it resets them.
+  - id: g6_read_state
+    mode: single
+    then:
+      - lambda: |-
+          auto *g6 = id(g6_control);
+          if (!g6->is_connected() || !id(g6_topology_ready) || id(g6_fu_play) == 0)
+            return;
+          const uint16_t index = static_cast<uint16_t>(id(g6_fu_play) << 8);
+          g6->control_transfer(0xA1, 0x81, 0x0100, index,
+              [](const usb_host::TransferStatus &st) {
+                if (st.success && st.data_len >= 9)
+                  id(g6_play_muted) = st.data[8] ? 1 : 0;
+              },
+              std::vector<uint8_t>(1));
+          g6->control_transfer(0xA1, 0x81, 0x0201, index,
+              [g6, index](const usb_host::TransferStatus &st) {
+                if (!st.success || st.data_len < 10)
+                  return;
+                const float left = static_cast<int16_t>(st.data[8] | (st.data[9] << 8)) / 256.0f;
+                g6->control_transfer(0xA1, 0x81, 0x0202, index,
+                    [g6, index, left](const usb_host::TransferStatus &st2) {
+                      if (!st2.success || st2.data_len < 10) {
+                        id(g6_play_volume) = left;
+                        return;
+                      }
+                      const float right = static_cast<int16_t>(st2.data[8] | (st2.data[9] << 8)) / 256.0f;
+                      const float level = std::max(left, right);
+                      id(g6_play_volume) = level;
+                      const float bal = std::isnan(id(g6_balance).state) ? 0.0f : id(g6_balance).state;
+                      const float want_left = std::max(level - std::max(0.0f, bal), -64.0f);
+                      const float want_right = std::max(level - std::max(0.0f, -bal), -64.0f);
+                      if (fabsf(left - want_left) <= 0.5f && fabsf(right - want_right) <= 0.5f)
+                        return;
+                      ESP_LOGD("g6", "Balance: setting left %.1f dB, right %.1f dB", want_left, want_right);
+                      const float want[2] = {want_left, want_right};
+                      for (uint8_t ch = 1; ch <= 2; ch++) {
+                        const int16_t v = static_cast<int16_t>(lroundf(want[ch - 1] * 256.0f));
+                        g6->control_transfer(0x21, 0x01, static_cast<uint16_t>(0x0200 | ch), index,
+                            [](const usb_host::TransferStatus &) {},
+                            {static_cast<uint8_t>(v & 0xFF), static_cast<uint8_t>((v >> 8) & 0xFF)});
+                      }
+                    },
+                    std::vector<uint8_t>(2));
+              },
+              std::vector<uint8_t>(2));
+
+  # Sets the G6's playback volume (both sides, with "G6 Balance" applied)
+  - id: g6_set_playback_volume
+    mode: restart
+    parameters:
+      volume: float
+    then:
+      - lambda: |-
+          auto *g6 = id(g6_control);
+          if (!g6->is_connected() || !id(g6_topology_ready) || id(g6_fu_play) == 0) {
+            ESP_LOGW("g6", "G6 playback volume unit not found; volume not set");
+            return;
+          }
+          const uint16_t index = static_cast<uint16_t>(id(g6_fu_play) << 8);
+          const float bal = std::isnan(id(g6_balance).state) ? 0.0f : id(g6_balance).state;
+          const float want[2] = {std::max(volume - std::max(0.0f, bal), -64.0f),
+                                 std::max(volume - std::max(0.0f, -bal), -64.0f)};
+          for (uint8_t ch = 1; ch <= 2; ch++) {
+            const int16_t v = static_cast<int16_t>(lroundf(want[ch - 1] * 256.0f));
+            const float db = want[ch - 1];
+            g6->control_transfer(0x21, 0x01, static_cast<uint16_t>(0x0200 | ch), index,
+                [ch, db](const usb_host::TransferStatus &st) {
+                  if (st.success) {
+                    ESP_LOGI("g6", "Playback volume ch%u: %.0f dB", static_cast<unsigned>(ch), db);
+                  } else {
+                    ESP_LOGW("g6", "Playback volume ch%u: failed (status %u)", static_cast<unsigned>(ch),
+                             static_cast<unsigned>(st.error_code));
+                  }
+                },
+                {static_cast<uint8_t>(v & 0xFF), static_cast<uint8_t>((v >> 8) & 0xFF)});
+          }
+
+  - id: g6_set_playback_mute
+    mode: restart
+    parameters:
+      mute: bool
+    then:
+      - lambda: |-
+          auto *g6 = id(g6_control);
+          if (!g6->is_connected() || !id(g6_topology_ready) || id(g6_fu_play) == 0) {
+            ESP_LOGW("g6", "G6 playback mute unit not found; mute not set");
+            return;
+          }
+          g6->control_transfer(0x21, 0x01, 0x0100, static_cast<uint16_t>(id(g6_fu_play) << 8),
+              [mute](const usb_host::TransferStatus &st) {
+                if (st.success) {
+                  ESP_LOGI("g6", "Playback %s", mute ? "muted" : "unmuted");
+                } else {
+                  ESP_LOGW("g6", "Playback mute: failed (status %u)", static_cast<unsigned>(st.error_code));
+                }
+              },
+              {static_cast<uint8_t>(mute ? 1 : 0)});
+
+  # Sends the queued Creative settings reports to the G6, one at a time, as
+  # HID SET_REPORT requests on the control endpoint (the 64-byte reports the
+  # soundblaster-x-g6-cli project captured from Creative's software).
+  - id: g6_hid_send
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: 'return !id(g6_hid_queue).empty();'
+          then:
+            - lambda: |-
+                auto &queue = id(g6_hid_queue);
+                auto *g6 = id(g6_control);
+                if (!g6->is_connected()) {
+                  ESP_LOGW("g6", "G6 not connected; %u Creative settings reports dropped",
+                           static_cast<unsigned>(queue.size()));
+                  queue.clear();
+                  return;
+                }
+                auto item = queue.front();
+                queue.erase(queue.begin());
+                const std::string label = item.first;
+                id(g6_hid_inflight) = true;
+                const bool sent = g6->control_transfer(0x21, 0x09, 0x0200, id(g6_hid_iface),
+                    [label](const usb_host::TransferStatus &st) {
+                      if (st.success) {
+                        ESP_LOGD("g6", "%s: ok", label.c_str());
+                      } else {
+                        ESP_LOGW("g6", "%s: the G6 refused the settings report (status %u)", label.c_str(),
+                                 static_cast<unsigned>(st.error_code));
+                      }
+                      id(g6_hid_inflight) = false;
+                    },
+                    item.second);
+                if (!sent) {
+                  ESP_LOGW("g6", "%s: couldn't send", label.c_str());
+                  id(g6_hid_inflight) = false;
+                }
+            - wait_until:
+                condition:
+                  lambda: 'return !id(g6_hid_inflight);'
+                timeout: 500ms
+
+  # Builds the G6 Lighting reports from the light's color. Waits briefly so
+  # the red, green and blue writes of one change go out as one command.
+  - id: g6_lighting_send
+    mode: restart
+    then:
+      - delay: 100ms
+      - lambda: |-
+          const auto &rgb = id(g6_rgb);
+          auto level = [](float v) {
+            return static_cast<uint8_t>(lroundf(std::min(std::max(v, 0.0f), 1.0f) * 255.0f));
+          };
+          const uint8_t r = level(rgb[0]), g = level(rgb[1]), b = level(rgb[2]);
+          auto frame = [](uint8_t m1, uint8_t m2, uint8_t i1, uint8_t i2, uint8_t feature,
+                          std::array<uint8_t, 4> value) {
+            std::vector<uint8_t> f(64, 0);
+            f[0] = 0x5A; f[1] = m1; f[2] = m2; f[3] = i1; f[4] = i2; f[5] = feature;
+            std::copy(value.begin(), value.end(), f.begin() + 6);
+            return f;
+          };
+          auto &queue = id(g6_hid_queue);
+          if (r == 0 && g == 0 && b == 0) {
+            ESP_LOGI("g6", "Lighting -> off");
+            queue.push_back({"lighting off", frame(0x3A, 0x02, 0x06, 0x00, 0x00, {0, 0, 0, 0})});
+          } else {
+            ESP_LOGI("g6", "Lighting -> R%u G%u B%u", static_cast<unsigned>(r), static_cast<unsigned>(g),
+                     static_cast<unsigned>(b));
+            for (int k = 0; k < 3; k++) {
+              queue.push_back({"lighting on", frame(0x3A, 0x02, 0x06, 0x01, 0x00, {0, 0, 0, 0})});
+              queue.push_back({"lighting mode", frame(0x3A, 0x06, 0x04, 0x00, 0x03, {0x01, 0x00, 0x01, 0x00})});
+              auto color = frame(0x3A, 0x09, 0x0A, 0x00, 0x03, {0x01, 0x01, 0xFF, b});
+              color[10] = g;
+              color[11] = r;
+              queue.push_back({"lighting color", color});
+            }
+          }
+          id(g6_hid_send)->execute();
+
+  # Ethernet-mode boot with no cable never reaches CONNECTED, so on_disconnect
+  # never fires and the device would stay in Ethernet mode forever. No IP
+  # within 30s of boot → reboot into Wi-Fi. A false flip (cable in, DHCP slow)
+  # self-heals: w5500_link_monitor sees the link and flips right back.
+  - id: eth_boot_connect_check
+    then:
+      - wait_until:
+          condition:
+            ethernet.connected:
+          timeout: 30s
+      - if:
+          condition:
+            not:
+              ethernet.connected:
+          then:
+            - globals.set:
+                id: use_wifi
+                value: 'true'
+            - lambda: 'global_preferences->sync();'
+            - delay: 500ms
+            - button.press: restart_button
+
+  - id: factory_reset_hold
+    mode: restart
+    then:
+      - lambda: 'id(factory_reset_armed) = false;'
+      - delay: 5s
+      - light.turn_on:
+          id: status_light
+          brightness: 100%
+          red: 100%
+          green: 0%
+          blue: 0%
+          effect: Factory Reset Blink
+      - delay: 10s
+      - light.turn_on:
+          id: status_light
+          brightness: 100%
+          red: 100%
+          green: 0%
+          blue: 0%
+          effect: "None"
+      - lambda: 'id(factory_reset_armed) = true;'
+
+
+power_supply:
+  - id: led_power
+    pin: 45
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_light
+    name: Status Light
+    entity_category: config
+    pin: 38
+    chipset: ws2812
+    channel_colors: GRB
+    num_leds: 1
+    power_supply: led_power
+    effects:
+      - strobe:
+      - addressable_rainbow:
+      - strobe:
+          name: Factory Reset Blink
+          colors:
+            - state: true
+              color_mode: RGB
+              red: 100%
+              green: 0%
+              blue: 0%
+              duration: 500ms
+            - state: false
+              duration: 500ms
+
+  # G6 logo lighting (Creative setting, only sent when changed)
+  - platform: rgb
+    id: g6_lighting
+    name: G6 Lighting
+    red: g6_led_red
+    green: g6_led_green
+    blue: g6_led_blue
+    gamma_correct: 1.0
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_OFF
+
+# The G6 Lighting color channels; g6_lighting_send turns them into reports
+output:
+  - platform: template
+    id: g6_led_red
+    type: float
+    write_action:
+      - lambda: 'id(g6_rgb)[0] = state;'
+      - script.execute: g6_lighting_send
+  - platform: template
+    id: g6_led_green
+    type: float
+    write_action:
+      - lambda: 'id(g6_rgb)[1] = state;'
+      - script.execute: g6_lighting_send
+  - platform: template
+    id: g6_led_blue
+    type: float
+    write_action:
+      - lambda: 'id(g6_rgb)[2] = state;'
+      - script.execute: g6_lighting_send
