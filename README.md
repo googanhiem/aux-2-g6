@@ -26,6 +26,11 @@ Bluetooth and the USB Z-Wave and Zigbee dongle support are removed, so the USB p
 - Home Assistant with the **dev** version of the ESPHome Device Builder. As of November 2026, the USB audio support this relies on is only in ESPHome's development builds, so the regular release won't build it yet.
 - Music Assistant, if you want to use the G6's input as a Sendspin source
 
+## What it doesn't have
+ - Bluetooth is disabled to help free up RAM on the ESP32.
+ - Z-Wave, Zigbee, and RS-485 USB discovery has also been removed as it wouldn't be used.
+ - All other AUX-2 functionality has remained (Audio and Serial connectivity).
+
 ## Installing
 
 1. Switch the ESPHome Device Builder to its dev version, then copy `aux-2-g6.yaml` into it.
